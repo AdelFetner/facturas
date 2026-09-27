@@ -12,8 +12,9 @@ import type { WsfeVatRate, WsfeVoucherInput } from "./wsfe";
 /**
  * The line an item describes. WSFE ignores every field here and derives its
  * header from the money alone; WSMTXCA requires `description`, `quantity`,
- * `unit` and `unitPrice` and sends the line as it is. The line never carries
- * its own VAT amount: that follows from the item's `vat` and its money.
+ * `unit`, `unitPrice`, and `matrixCode` with `matrixUnits` unless `unit` is 97
+ * or 99, and sends the line as it is. The line never carries its own VAT
+ * amount: that follows from the item's `vat` and its money.
  */
 export type ItemLine = {
   description?: string;
@@ -22,8 +23,11 @@ export type ItemLine = {
   /** A major-unit decimal string with up to six decimals, unlike every other amount. */
   unitPrice?: string;
   discount?: number;
+  /** Your own product code, at most 50 characters. */
   code?: string;
+  /** The product's GTIN, or one of `ARCA_WSMTXCA_GENERIC_CODES`. */
   matrixCode?: string;
+  /** Whole units of `matrixCode`, from 1 to 999999. */
   matrixUnits?: number;
 };
 export type VatRate = SupportedVatRate | "exempt" | "untaxed";
@@ -249,7 +253,8 @@ export type WsmtxcaSettlement = {
  * so the two can never describe different money. Per-line VAT is reconciled
  * against the grouped Half Even arithmetic of `calculateWsfeAmounts()`: the
  * rounding residual of a rate, and the header's VAT adjustment, land on lines
- * of that rate, so the lines sum to the header exactly.
+ * of that rate, so the lines sum to the header exactly. WSMTXCA authorizes
+ * classes A and B only, so every item carries its `vat`.
  */
 export function deriveWsmtxcaLines(
   input: WsfeAmountsInput,
@@ -266,7 +271,6 @@ export function deriveWsmtxcaSettlement(
   if (!Array.isArray(input.items) || input.items.length === 0) {
     invalidItem("items", "a non-empty array of items");
   }
-  const isVat = input.voucherClass === "A" || input.voucherClass === "B";
   const drafts: LineDraft[] = [];
   const groups = new Map<SupportedVatRate, { net: bigint; gross: bigint }>();
   for (const [index, item] of input.items.entries()) {
@@ -274,7 +278,7 @@ export function deriveWsmtxcaSettlement(
     if (item === null || typeof item !== "object" || Array.isArray(item)) {
       invalidItem(path, "an item object");
     }
-    drafts.push(lineDraft(item, path, isVat, groups));
+    drafts.push(lineDraft(item, path, groups));
   }
   reconcileGroups(drafts, groups);
   absorbAdjustment(drafts, BigInt(vatAdjustment));
@@ -300,20 +304,9 @@ export function deriveWsmtxcaSettlement(
 function lineDraft(
   item: VatItem | AmountItem,
   path: string,
-  isVat: boolean,
   groups: Map<SupportedVatRate, { net: bigint; gross: bigint }>
 ): LineDraft {
   const line = assertItemLine(item, path);
-  if (!isVat) {
-    // A class C line bears no VAT at all, so it reports the 0% condition.
-    const amount = classCAmount(item, path);
-    return {
-      line: { ...line, vatCondition: RATES[0].id, amount: 0 },
-      vat: 0n,
-      amount,
-      amountFormula: { numerator: amount, denominator: 1n },
-    };
-  }
   const { amount, field, rate } = vatItemAmount(item, path);
   if (rate === "exempt" || rate === "untaxed") {
     return {
@@ -536,9 +529,7 @@ function assertItemLine(
       invalidItem(`${path}.${key}`, "a string");
     }
   }
-  if (item.matrixUnits !== undefined && !Number.isFinite(item.matrixUnits)) {
-    invalidItem(`${path}.matrixUnits`, "a number");
-  }
+  assertMatrixFields(item, path);
   return {
     ...(item.matrixUnits === undefined
       ? {}
@@ -553,6 +544,45 @@ function assertItemLine(
       assertArcaMinorUnits(item.discount ?? 0, `${path}.discount`)
     ),
   };
+}
+
+/** Units ARCA exempts from the matrix code: 97 (señas) and 99 (bonificación). */
+const MATRIX_EXEMPT_UNITS = new Set([97, 99]);
+
+/**
+ * WSMTXCA rules 500-505 and 520: every line but units 97 and 99 carries a
+ * GTIN or generic code with whole matrix units, and the two travel together.
+ */
+function assertMatrixFields(item: VatItem | AmountItem, path: string): void {
+  const { code, matrixCode, matrixUnits, unit } = item;
+  if (code !== undefined && code.length > 50) {
+    invalidItem(`${path}.code`, "at most 50 characters");
+  }
+  if (matrixCode !== undefined && matrixCode.trim() === "") {
+    invalidItem(`${path}.matrixCode`, "a GTIN or ARCA generic code");
+  }
+  if (
+    matrixUnits !== undefined &&
+    !(
+      Number.isInteger(matrixUnits) &&
+      matrixUnits >= 1 &&
+      matrixUnits <= 999_999
+    )
+  ) {
+    invalidItem(`${path}.matrixUnits`, "a whole number from 1 to 999999");
+  }
+  if ((matrixCode === undefined) !== (matrixUnits === undefined)) {
+    invalidItem(
+      matrixCode === undefined ? `${path}.matrixCode` : `${path}.matrixUnits`,
+      "matrixCode and matrixUnits together"
+    );
+  }
+  if (matrixCode === undefined && !MATRIX_EXEMPT_UNITS.has(unit as number)) {
+    invalidItem(
+      `${path}.matrixCode`,
+      "a GTIN or ARCA generic code with matrixUnits, unless unit is 97 or 99"
+    );
+  }
 }
 
 function assertRequiredLineFields(

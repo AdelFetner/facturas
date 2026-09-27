@@ -6,10 +6,12 @@ import {
   ARCA_ISSUER_CONDITION_IDS,
   ARCA_RECEIVER_CONDITION_IDS,
   ARCA_VOUCHER_TYPES,
+  type IssuerCondition,
+  type IssuerConditionId,
   type ReceiverCondition,
   type VoucherClass,
 } from "../constants";
-import { ArcaError, ArcaInputError } from "../errors";
+import { ArcaError, ArcaInputError, type VoucherDateWindow } from "../errors";
 import { toIsoDate } from "../internal/dates";
 import {
   normalizeArcaAmountToMinorUnits,
@@ -17,6 +19,7 @@ import {
 } from "../internal/decimal";
 import {
   applyIssuanceFields,
+  CONCEPT_IDS,
   FAMILIES,
   type InvoiceFamily,
   ISSUANCE_KEYS,
@@ -29,6 +32,7 @@ import {
   type VoucherAmounts,
   validateFiscalHeader,
   validateIssuanceFields,
+  voucherFamily,
 } from "./issuance-fields";
 import {
   normalizeWsfeDateInput,
@@ -74,17 +78,17 @@ export type IssueCommon = IssuanceFields & {
 export type IssueInput = IssueCommon &
   (
     | {
-        issuer: "responsable_inscripto";
+        issuer: "responsable_inscripto" | 1;
         items: readonly VatItem[];
         amounts?: never;
       }
     | {
-        issuer: "monotributo" | "exento" | "no_alcanzado";
+        issuer: "monotributo" | "exento" | "no_alcanzado" | 4 | 6 | 15;
         items: readonly AmountItem[];
         amounts?: never;
       }
     | {
-        issuer: import("../constants").IssuerCondition;
+        issuer: IssuerCondition | IssuerConditionId;
         amounts: import("./issuance-fields").VoucherAmounts;
         items?: never;
       }
@@ -129,10 +133,10 @@ export function deriveWsfeInvoice(
   if (input.amounts !== undefined && input.items !== undefined) {
     invalid("amounts", "used instead of items, never with items");
   }
-  assertIssuerCondition(input.issuer);
+  const issuer = issuerCondition(input.issuer);
   assertSalesPoint(input.salesPoint);
   const receiver = deriveReceiver(input.to);
-  const voucherClass = resolveInvoiceClass(input.issuer, input.to.condition);
+  const voucherClass = resolveInvoiceClass(issuer, input.to.condition);
   const lineSource: WsfeAmountsInput | undefined = input.amounts
     ? undefined
     : {
@@ -261,16 +265,31 @@ export function reviewedInvoiceAmounts(
   };
 }
 
-function assertIssuerCondition(issuer: IssueInput["issuer"]) {
+/** The name of an issuer condition given as its ARCA identifier, if one is. */
+export function issuerConditionName(
+  issuer: unknown
+): IssuerCondition | undefined {
+  return (Object.keys(ARCA_ISSUER_CONDITION_IDS) as IssuerCondition[]).find(
+    (condition) => ARCA_ISSUER_CONDITION_IDS[condition] === issuer
+  );
+}
+
+/** The issuer's condition by name, given its name or its ARCA identifier. */
+function issuerCondition(issuer: unknown): IssuerCondition {
+  const name = issuerConditionName(issuer);
+  if (name !== undefined) {
+    return name;
+  }
   if (
     typeof issuer !== "string" ||
     !Object.hasOwn(ARCA_ISSUER_CONDITION_IDS, issuer)
   ) {
     invalid(
       "issuer",
-      "responsable_inscripto, monotributo, exento, or no_alcanzado"
+      "responsable_inscripto, monotributo, exento, no_alcanzado, or their ARCA ids 1, 6, 4, 15"
     );
   }
+  return issuer as IssuerCondition;
 }
 
 function assertSalesPoint(salesPoint: number) {
@@ -285,7 +304,7 @@ function assertSalesPoint(salesPoint: number) {
 
 /** Class resolution: the issuer's condition and the receiver's condition fix it. */
 function resolveInvoiceClass(
-  issuer: IssueInput["issuer"],
+  issuer: IssuerCondition,
   condition: ReceiverCondition | number
 ): VoucherClass {
   if (typeof condition === "number") {
@@ -467,17 +486,63 @@ const FCE_TYPES: readonly (readonly number[])[] = Object.values(FAMILIES.fce);
 const FCE_INVOICE_TYPES = FCE_TYPES.map(([invoice]) => invoice);
 const FCE_NOTE_TYPES = FCE_TYPES.flatMap(([, ...notes]) => notes);
 
+export type VoucherDateWindowInput = {
+  voucherType: number;
+  /** What the voucher bills; `"products"` when omitted, as in `issue()`. */
+  concept?: NonNullable<IssuanceFields["concept"]>;
+  /** The service that will authorize it; `"wsfe"` when omitted. */
+  service?: "wsfe" | "wsmtxca";
+  /** When it will be sent; its day in Argentina anchors the window. */
+  now?: Date;
+};
+
+/**
+ * The dates ARCA accepts for a voucher sent now, the same window `issue()`
+ * checks before any call. Pure, no I/O. ARCA still rejects a date before the
+ * last voucher of the same type and sales point.
+ */
+export function voucherDateWindow(
+  input: VoucherDateWindowInput
+): VoucherDateWindow {
+  assertIssueObject(input, "input");
+  assertIssueKeys(
+    input,
+    ["voucherType", "concept", "service", "now"],
+    "input",
+    "voucherDateWindow()"
+  );
+  const concept = input.concept ?? "products";
+  if (!Object.hasOwn(CONCEPT_IDS, concept)) {
+    invalid("concept", "products, services, or products_and_services");
+  }
+  const service = input.service ?? "wsfe";
+  if (service !== "wsfe" && service !== "wsmtxca") {
+    invalid("service", "wsfe or wsmtxca");
+  }
+  const now = input.now ?? new Date();
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
+    invalid("now", "a valid Date");
+  }
+  voucherFamily(input.voucherType);
+  const { from, to } = dateWindow(
+    { concept: CONCEPT_IDS[concept], voucherType: input.voucherType },
+    service,
+    buenosAiresDate(now)
+  );
+  return { from: isoDay(from), to: isoDay(to) };
+}
+
 /**
  * ARCA only accepts a voucher dated near the day it is sent (WSFE 10016,
  * WSMTXCA 103): products 5 days either side without leaving the month,
  * services 10. On WSFE an FCE invoice also stays within 5 days before and 1
  * after, and an FCE note within 5 days before. `today` is Argentina's date.
  */
-export function assertVoucherDateWindow(
-  data: Pick<WsfeVoucherInput, "concept" | "voucherDate" | "voucherType">,
+function dateWindow(
+  data: Pick<WsfeVoucherInput, "concept" | "voucherType">,
   service: "wsfe" | "wsmtxca",
   today: WsfeDateInput
-): void {
+): { from: WsfeDateInput; to: WsfeDateInput } {
   const products = data.concept === 1;
   let from = addDays(today, products ? -5 : -10);
   let to = addDays(today, products ? 5 : 10);
@@ -491,12 +556,31 @@ export function assertVoucherDateWindow(
   if (service === "wsfe" && FCE_NOTE_TYPES.includes(data.voucherType)) {
     from = maxDate(from, addDays(today, -5));
   }
+  return { from, to };
+}
+
+export function assertVoucherDateWindow(
+  data: Pick<WsfeVoucherInput, "concept" | "voucherDate" | "voucherType">,
+  service: "wsfe" | "wsmtxca",
+  today: WsfeDateInput
+): void {
+  const { from, to } = dateWindow(data, service, today);
   if (data.voucherDate < from || data.voucherDate > to) {
-    invalid(
-      "date",
-      `from ${toIsoDate(from)} through ${toIsoDate(to)}, the window ARCA accepts on ${toIsoDate(today)}`
+    const window = { from: isoDay(from), to: isoDay(to) };
+    throw new ArcaInputError(
+      `date must be from ${window.from} through ${window.to}, the window ARCA accepts on ${isoDay(today)}.`,
+      {
+        code: "ARCA_INPUT_DATE_OUTSIDE_WINDOW",
+        field: "date",
+        expected: `a date from ${window.from} through ${window.to}`,
+        window,
+      }
     );
   }
+}
+
+function isoDay(date: WsfeDateInput): string {
+  return toIsoDate(date) ?? date;
 }
 
 /** Day arithmetic on `YYYYMMDD`; `Date.UTC` rolls overflowing days and months. */

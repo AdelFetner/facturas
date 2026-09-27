@@ -320,6 +320,8 @@ const LINE = {
   quantity: 2,
   unit: 7,
   unitPrice: "50.000000",
+  matrixCode: "7790001001054",
+  matrixUnits: 2,
 };
 const withLines = <T extends object>(items: readonly T[]) =>
   items.map((item) => ({ ...LINE, ...item }));
@@ -384,13 +386,6 @@ describe("WSMTXCA lines derived from the same items", () => {
         (line) => line.vatCondition
       )
     ).toEqual([5, 4, 3, 9, 8, 6, 2, 1]);
-    // A class C line bears no VAT, so it reports the 0% condition and no amount.
-    expect(
-      deriveWsmtxcaLines(
-        { voucherClass: "C", items: withLines([{ amount: 500 }]) },
-        0
-      )
-    ).toEqual([{ ...LINE, discount: 0, vatCondition: 3, amount: 500 }]);
   });
   it("reports the VAT amount on class A lines only", () => {
     const input = { items: withLines([{ gross: 12_100, vat: 21 as const }]) };
@@ -429,6 +424,8 @@ describe("WSMTXCA lines derived from the same items", () => {
       quantity: 1,
       unit: 7,
       unitPrice: "100.02",
+      matrixCode: "7790001001054",
+      matrixUnits: 1,
       net: 10_002,
       vat: 21 as const,
     }));
@@ -447,6 +444,8 @@ describe("WSMTXCA lines derived from the same items", () => {
       quantity: 1,
       unit: 7,
       unitPrice: "0.016529",
+      matrixCode: "7790001001054",
+      matrixUnits: 1,
       gross: 2,
       vat: 21 as const,
     }));
@@ -498,11 +497,12 @@ describe("WSMTXCA lines derived from the same items", () => {
     expect(
       deriveWsmtxcaLines(
         {
-          voucherClass: "C",
+          voucherClass: "B",
           items: [
             {
               ...LINE,
-              amount: 100,
+              gross: 100,
+              vat: 21,
               discount: 25,
               code: "SKU-1",
               matrixCode: "MTX-1",
@@ -520,9 +520,18 @@ describe("WSMTXCA lines derived from the same items", () => {
         code: "SKU-1",
         matrixCode: "MTX-1",
         matrixUnits: 3,
-        vatCondition: 3,
+        vatCondition: 5,
       },
     ]);
+  });
+  it.each([97, 99])("lets unit %i omit the matrix fields", (unit) => {
+    const { matrixCode: _code, matrixUnits: _units, ...line } = LINE;
+    expect(() =>
+      deriveWsmtxcaLines(
+        { voucherClass: "B", items: [{ ...line, unit, gross: 100, vat: 21 }] },
+        0
+      )
+    ).not.toThrow();
   });
   it.each([
     ["items[1].description", { description: "" }],
@@ -536,11 +545,11 @@ describe("WSMTXCA lines derived from the same items", () => {
     expect(() =>
       deriveWsmtxcaLines(
         {
-          voucherClass: "C",
+          voucherClass: "B",
           items: [
-            { ...LINE, amount: 100 },
-            { ...LINE, ...change, amount: 100 },
-          ] as AmountItem[],
+            { ...LINE, gross: 100, vat: 21 },
+            { ...LINE, ...change, gross: 100, vat: 21 },
+          ] as VatItem[],
         },
         0
       )
