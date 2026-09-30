@@ -522,7 +522,8 @@ async function runOperation(
         select: select ?? (() => wsfe),
         options,
         supersededBy: idempotencyKey,
-        readNext: () => nextNumber(wsfe, prepared.data, options),
+        readNext: () =>
+          nextNumber(wsfe, prepared.data, { ...options, number: undefined }),
       });
       return "blocked" in barrier
         ? {
@@ -588,12 +589,21 @@ async function runOperation(
       const outcome = await settle(
         runAuthorization(wsfe, prepared, options, issuer, number)
       );
-      if (coordinated && outcome.kind !== "indeterminate") {
-        // ARCA reported this claim, so the next one needs no consultation.
+      if (
+        coordinated &&
+        outcome.kind !== "indeterminate" &&
+        outcome.kind !== "rejected"
+      ) {
+        // ARCA settled the number, so the next claim needs no consultation. A
+        // rejection leaves it empty: the next claim must prove that and record
+        // this key as superseded
         await storeCall(() =>
           store.set(
             sequenceRecord,
-            JSON.stringify({ ...claimed, resolvedAt: new Date().toISOString() })
+            JSON.stringify({
+              ...claimed,
+              resolvedAt: new Date().toISOString(),
+            })
           )
         );
       }
@@ -2065,8 +2075,9 @@ type BarrierResult =
 
 /**
  * Holds the sequence while the last claim on it is unresolved. A claim ARCA
- * already reported and a recorded conflict clear it. An empty number clears it
- * only once the sequence proves it never moved: then the old key is recorded
+ * authorized and a recorded conflict clear it. An empty number, rejected or
+ * never answered, clears it only once the sequence proves it never moved past
+ * it: then the old key is recorded
  * as superseded, so its own retry can never take the number this call is about
  * to write. A lookup that cannot answer writes nothing at all.
  */
@@ -2087,7 +2098,10 @@ async function runSequenceBarrier({
     return {};
   }
   const claimed = readSequenceRecord(json);
-  if (claimed.resolvedAt !== undefined) {
+
+  // A call with the key that holds the claim is its own retry: claim() replays
+  // that reservation, and a key must never supersede itself.
+  if (claimed.resolvedAt !== undefined || claimed.key === supersededBy) {
     return {};
   }
   // The claim may belong to another issuer representing the same taxpayer: its
@@ -2145,9 +2159,10 @@ async function runSequenceBarrier({
   }
   // The consultation saw nothing. Only the sequence itself proves the number is
   // free: if ARCA already moved past it, a write this lookup could not see is
-  // out there and nothing may be superseded.
+  // out there and nothing may be superseded. A number still ahead of the
+  // sequence cannot hold a write, since ARCA only authorizes the next one.
   const next = await readNext();
-  if (next !== record.number) {
+  if (next > record.number) {
     return blocked;
   }
   await storeCall(() =>

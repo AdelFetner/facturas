@@ -63,6 +63,23 @@ const rejected10016: WsfeAuthorizationOutcome = {
     },
   ],
 };
+/** A business rule rejects the voucher itself, not its number. */
+const rejectedRule: WsfeAuthorizationOutcome = {
+  ...base,
+  kind: "rejected",
+  result: "R",
+  resultLevel: "detail",
+  errors: [
+    {
+      service: "wsfe",
+      operation: "FECAESolicitar",
+      source: "error",
+      category: "business",
+      code: "10015",
+      message: "invalid document",
+    },
+  ],
+};
 const absent: WsfeVoucherLookupResult = {
   kind: "not_found",
   service: "wsfe",
@@ -425,6 +442,25 @@ describe("superseded claims", () => {
     ).toBeNull();
     expect(wsfe.issue).toHaveBeenCalledTimes(writes);
   });
+  it("asks ARCA, not a manual number, whether the sequence moved", async () => {
+    const { wsfe } = provider();
+    const store = createMemoryStore();
+    const arca = service(store, wsfe);
+    await strand(arca, wsfe);
+
+    wsfe.getNextVoucherNumber.mockResolvedValue(78);
+    const writes = wsfe.issue.mock.calls.length;
+    expect(
+      await arca.issue(input, { idempotencyKey: "key2", number: 50 })
+    ).toMatchObject({
+      kind: "indeterminate",
+      lookup: { kind: "blocked", by: "key1" },
+    });
+    expect(
+      await store.get(settledKey("test", "20123456789", "key1"))
+    ).toBeNull();
+    expect(wsfe.issue).toHaveBeenCalledTimes(writes);
+  });
   it("reports a superseded key whose number stayed empty", async () => {
     const { wsfe } = provider();
     const arca = service(createMemoryStore(), wsfe);
@@ -445,6 +481,102 @@ describe("superseded claims", () => {
       });
     }
     expect(wsfe.issue).toHaveBeenCalledTimes(writes);
+  });
+  it.each([
+    ["memory", () => Promise.resolve(createMemoryStore())],
+    ["file", async () => createFileStore(await fileStore())],
+  ])("never gives a rejected key its successor's CAE (%s)", async (_, open) => {
+    const { wsfe } = provider();
+    const store = await open();
+    const arca = service(store, wsfe);
+    // A business rule rejects key1, so 77 stays empty.
+    wsfe.issue.mockImplementationOnce(() => Promise.resolve(rejectedRule));
+    expect(await arca.issue(input, { idempotencyKey: "key1" })).toMatchObject({
+      kind: "rejected",
+      attempted: { number: 77 },
+    });
+    // The same sale under a new key proves 77 is free and takes it.
+    expect(await arca.issue(input, { idempotencyKey: "key2" })).toMatchObject({
+      kind: "authorized",
+      voucher: { number: 77, cae: "74123456789077" },
+    });
+    expect(
+      JSON.parse(
+        (await store.get(settledKey("test", "20123456789", "key1"))) ?? "null"
+      )
+    ).toMatchObject({ v: 1, kind: "superseded", number: 77, by: "key2" });
+    const writes = wsfe.issue.mock.calls.length;
+    for (const outcome of [
+      await arca.issue(input, { idempotencyKey: "key1" }),
+      await arca.recover("key1"),
+    ]) {
+      expect(outcome).toMatchObject({
+        kind: "indeterminate",
+        attempted: { number: 77 },
+        lookup: { kind: "superseded", by: "key2" },
+      });
+      expect(outcome).not.toHaveProperty("voucher");
+    }
+    expect(wsfe.issue).toHaveBeenCalledTimes(writes);
+  });
+  it("resends a rejected key while its number is still free", async () => {
+    const { wsfe } = provider();
+    const arca = service(createMemoryStore(), wsfe);
+    wsfe.issue.mockImplementationOnce(() => Promise.resolve(rejectedRule));
+    expect((await arca.issue(input, { idempotencyKey: "key1" })).kind).toBe(
+      "rejected"
+    );
+    expect(await arca.issue(input, { idempotencyKey: "key1" })).toMatchObject({
+      kind: "authorized",
+      recoveredByMatch: false,
+      voucher: { number: 77 },
+    });
+    expect(wsfe.issue).toHaveBeenCalledTimes(2);
+  });
+  it("lets a concurrent same-key call resend its rejected number", async () => {
+    const { wsfe } = provider();
+    const store = createMemoryStore();
+    const arca = service(store, wsfe);
+    // A double submit: the first call is rejected while the second waits.
+    wsfe.issue.mockImplementationOnce(() => Promise.resolve(rejectedRule));
+    const outcomes = await Promise.all([
+      arca.issue(input, { idempotencyKey: "sale" }),
+      arca.issue(input, { idempotencyKey: "sale" }),
+    ]);
+    expect(outcomes.map((outcome) => outcome.kind).sort()).toEqual([
+      "authorized",
+      "rejected",
+    ]);
+    expect(
+      await store.get(settledKey("test", "20123456789", "sale"))
+    ).toBeNull();
+    expect(wsfe.issue.mock.calls.map(([call]) => call.voucherNumber)).toEqual([
+      77, 77,
+    ]);
+  });
+  it("supersedes a rejected manual number ahead of the sequence", async () => {
+    const { wsfe } = provider();
+    const store = createMemoryStore();
+    const arca = service(store, wsfe);
+    // ARCA only takes 77, so a manual 80 is rejected and can never hold a
+    // write while the sequence stays behind it.
+    expect(
+      await arca.issue(input, { idempotencyKey: "key1", number: 80 })
+    ).toMatchObject({ kind: "rejected", attempted: { number: 80 } });
+    expect(await arca.issue(input, { idempotencyKey: "key2" })).toMatchObject({
+      kind: "authorized",
+      voucher: { number: 77 },
+    });
+    expect(
+      JSON.parse(
+        (await store.get(settledKey("test", "20123456789", "key1"))) ?? "null"
+      )
+    ).toMatchObject({ kind: "superseded", number: 80, by: "key2" });
+    expect(await arca.recover("key1")).toMatchObject({
+      kind: "indeterminate",
+      attempted: { number: 80 },
+      lookup: { kind: "superseded", by: "key2" },
+    });
   });
 });
 

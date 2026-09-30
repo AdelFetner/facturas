@@ -43,9 +43,10 @@ export type ArcaAttemptRecord = {
  * `superseded` record says the sequence moved past this reservation: the
  * barrier proved the number was empty and handed it to `by`, so this key can
  * never write. Authorizations are not recorded, because ARCA is their source of
- * truth, and rejections are not, because the input is fixed under a new key. A
- * reader that does not know a future `kind` refuses the record instead of
- * guessing.
+ * truth. A rejection records nothing itself: its number stays empty, a retry
+ * while it is still free resends it, and the next key's barrier records it as
+ * `superseded` once it proves the number empty. A reader that does not know a
+ * future `kind` refuses the record instead of guessing.
  */
 export type ArcaSettledRecord =
   | {
@@ -78,8 +79,10 @@ export function attemptKey(
  * The last reservation claimed on one sequence through this store, written
  * with `set` under the sequence lock and before the reservation it names, so
  * no reservation can exist that the barrier does not see. `resolvedAt` marks a
- * claim whose fate ARCA already reported, so the next claim needs no
- * consultation.
+ * claim ARCA settled on its number, authorized or in conflict, so the next
+ * claim needs no consultation. A rejected or unanswered claim stays unresolved:
+ * its number may still be empty, and the barrier must prove it before handing
+ * it over.
  */
 export type ArcaSequenceRecord = {
   v: 1;
