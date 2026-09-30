@@ -19,6 +19,13 @@ export type ArcaStore = {
  * replaying a WSMTXCA reservation through WSFE. Version 2 has three compatible
  * line spellings: releases through 0.12 wrote `details`; 0.13 writes `lines`,
  * or `authorizedLines` when a full note mirrors provider-authorized history.
+ *
+ * `rejectedAt` marks a reservation whose last submission ARCA rejected, so
+ * this key never wrote its number and any voucher found there is a
+ * stranger's. It is the one field rewritten with `set`: cleared before a
+ * retry resends the number and written again if ARCA rejects that too.
+ * Readers that predate it ignore it and match a voucher there by its fiscal
+ * fields, so every process sharing a store must run a release that knows it.
  */
 export type ArcaAttemptRecord = {
   v: 1 | 2;
@@ -35,6 +42,7 @@ export type ArcaAttemptRecord = {
     details?: readonly import("../services/issuance-wsmtxca").LegacyWsmtxcaLine[];
   };
   createdAt: string;
+  rejectedAt?: string;
 };
 
 /**
@@ -43,10 +51,9 @@ export type ArcaAttemptRecord = {
  * `superseded` record says the sequence moved past this reservation: the
  * barrier proved the number was empty and handed it to `by`, so this key can
  * never write. Authorizations are not recorded, because ARCA is their source of
- * truth. A rejection records nothing itself: its number stays empty, a retry
- * while it is still free resends it, and the next key's barrier records it as
- * `superseded` once it proves the number empty. A reader that does not know a
- * future `kind` refuses the record instead of guessing.
+ * truth, and rejections live on the reservation as `rejectedAt`, because a
+ * retry may still write the number. A reader that does not know a future
+ * `kind` refuses the record instead of guessing.
  */
 export type ArcaSettledRecord =
   | {
@@ -79,10 +86,10 @@ export function attemptKey(
  * The last reservation claimed on one sequence through this store, written
  * with `set` under the sequence lock and before the reservation it names, so
  * no reservation can exist that the barrier does not see. `resolvedAt` marks a
- * claim ARCA settled on its number, authorized or in conflict, so the next
- * claim needs no consultation. A rejected or unanswered claim stays unresolved:
- * its number may still be empty, and the barrier must prove it before handing
- * it over.
+ * claim whose fate ARCA already reported, on its first submission or on a
+ * retry, so the next claim needs no consultation. A rejected key takes the
+ * marker back, unresolved, before it resends its number. Only an unanswered
+ * claim stays unresolved.
  */
 export type ArcaSequenceRecord = {
   v: 1;
