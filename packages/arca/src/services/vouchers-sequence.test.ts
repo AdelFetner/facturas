@@ -737,13 +737,8 @@ describe("rejected retries", () => {
     });
     expect(wsfe.issue).toHaveBeenCalledTimes(writes);
   });
-  it("keeps recover() from calling a retry's own voucher foreign", async () => {
-    const { wsfe } = provider();
-    const store = createMemoryStore();
-    const arca = service(store, wsfe);
-    await reject(arca, wsfe);
-    // recover() reads the rejection, then its lookup waits while a retry
-    // clears it and writes 77.
+  /** Holds recover()'s next lookup until the returned function runs. */
+  function holdLookup(wsfe: ReturnType<typeof provider>["wsfe"]) {
     let open: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => {
       open = resolve;
@@ -753,20 +748,92 @@ describe("rejected retries", () => {
       await gate;
       return (lookup as NonNullable<typeof lookup>)(call);
     });
+    return open;
+  }
+  /** Lets a retry run to its end, unless the sequence lock holds it back. */
+  const settleOrWait = (retrying: Promise<unknown>) =>
+    Promise.race([retrying, new Promise((resolve) => setTimeout(resolve, 50))]);
+
+  it("makes a retry wait for recover() on the same sequence", async () => {
+    const { wsfe } = provider();
+    const store = createMemoryStore();
+    const arca = service(store, wsfe);
+    await reject(arca, wsfe);
+    const open = holdLookup(wsfe);
     const recovering = arca.recover("key1");
     await vi.waitFor(() => expect(wsfe.lookupVoucher).toHaveBeenCalled());
-    expect(await arca.issue(input, { idempotencyKey: "key1" })).toMatchObject({
-      kind: "authorized",
-      voucher: { number: 77 },
-    });
+    const retrying = arca.issue(input, { idempotencyKey: "key1" });
+    await settleOrWait(retrying);
     open();
+    // recover() still sees the rejection and an empty number. the retry
+    // resends only after it.
     expect(await recovering).toMatchObject({
+      kind: "indeterminate",
+      lookup: { kind: "not_found" },
+    });
+    expect(await retrying).toMatchObject({
       kind: "authorized",
       voucher: { number: 77 },
     });
     expect(
       await store.get(settledKey("test", "20123456789", "key1"))
     ).toBeNull();
+    expect(await arca.recover("key1")).toMatchObject({
+      kind: "authorized",
+      recoveredByMatch: true,
+      voucher: { number: 77 },
+    });
+  });
+  it("makes recover() read the rejection again once it holds the lock", async () => {
+    const { wsfe } = provider();
+    const store = createMemoryStore();
+    const arca = service(store, wsfe);
+    await reject(arca, wsfe);
+    // The retry holds the lock while it checks 77, before it clears the
+    // rejection and resends.
+    const open = holdLookup(wsfe);
+    const retrying = arca.issue(input, { idempotencyKey: "key1" });
+    await vi.waitFor(() => expect(wsfe.lookupVoucher).toHaveBeenCalled());
+    // recover() reads the rejection, then waits for the lease.
+    const recovering = arca.recover("key1");
+    await settleOrWait(recovering);
+    open();
+    expect(await retrying).toMatchObject({
+      kind: "authorized",
+      voucher: { number: 77 },
+    });
+    expect(await recovering).toMatchObject({
+      kind: "authorized",
+      recoveredByMatch: true,
+      voucher: { number: 77 },
+    });
+    expect(
+      await store.get(settledKey("test", "20123456789", "key1"))
+    ).toBeNull();
+  });
+  it("never lets recover() take a stranger's CAE during a retry", async () => {
+    const { wsfe, land } = provider();
+    const arca = service(createMemoryStore(), wsfe);
+    await reject(arca, wsfe);
+    const open = holdLookup(wsfe);
+    const recovering = arca.recover("key1");
+    await vi.waitFor(() => expect(wsfe.lookupVoucher).toHaveBeenCalled());
+    // The retry resends 77, but a keyless sale with the same data got there
+    // first.
+    wsfe.issue.mockImplementationOnce(({ data }) => {
+      land(77, data);
+      return Promise.resolve(rejected10016);
+    });
+    const retrying = arca.issue(input, { idempotencyKey: "key1" });
+    await settleOrWait(retrying);
+    open();
+    const recovered = await recovering;
+    expect(recovered).not.toMatchObject({ kind: "authorized" });
+    expect(await retrying).toMatchObject({
+      kind: "conflict",
+      found: { number: 77 },
+    });
+    expect(await arca.recover("key1")).toMatchObject({ kind: "conflict" });
   });
   it("treats a voucher landing during the resend as a stranger's", async () => {
     const { wsfe, land } = provider();
@@ -874,6 +941,26 @@ describe("issuers sharing a sequence", () => {
     ).toBe("indeterminate");
   }
 
+  it("never lets a rejected key take another issuer's claim on the same key", async () => {
+    const { wsfe } = provider();
+    const store = createMemoryStore();
+    const a = service(store, wsfe, first);
+    const b = service(store, wsfe, second);
+    wsfe.issue.mockImplementationOnce(() => Promise.resolve(rejectedRule));
+    expect(
+      (await a.issue(input, { ...represented, idempotencyKey: "sale" })).kind
+    ).toBe("rejected");
+    // The other issuer claims 77 under the same key, and its write is lost.
+    await strand(b, wsfe, "sale");
+    const writes = wsfe.issue.mock.calls.length;
+    expect(
+      await a.issue(input, { ...represented, idempotencyKey: "sale" })
+    ).toMatchObject({
+      kind: "indeterminate",
+      lookup: { kind: "blocked", by: "sale", byTaxId: second },
+    });
+    expect(wsfe.issue).toHaveBeenCalledTimes(writes);
+  });
   it("names the issuer that holds the claim", async () => {
     const { wsfe } = provider();
     const store = createMemoryStore();
@@ -1176,6 +1263,31 @@ describe("claim durability", () => {
       expect(outcome).not.toHaveProperty("voucher");
     }
     expect(wsfe.issue).toHaveBeenCalledTimes(2);
+  });
+  it("reads the sequence marker once per issuance", async () => {
+    const { wsfe } = provider();
+    const memory = createMemoryStore();
+    const reads = vi.fn();
+    const arca = service(
+      {
+        ...memory,
+        get: (key) => {
+          if (key === sequence) {
+            reads();
+          }
+          return memory.get(key);
+        },
+      },
+      wsfe
+    );
+    for (const idempotencyKey of ["a", "b"]) {
+      reads.mockClear();
+      expect((await arca.issue(input, { idempotencyKey })).kind).toBe(
+        "authorized"
+      );
+      // The barrier reads it; the claim resolves the marker it just wrote.
+      expect(reads).toHaveBeenCalledTimes(1);
+    }
   });
   it("keeps the marker on the winner when a same-key call loses the race", async () => {
     const { wsfe } = provider();

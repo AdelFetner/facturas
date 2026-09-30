@@ -524,7 +524,6 @@ async function runOperation(
         taxId,
         sequence: sequenceRecord,
         sequenceTaxId: sequence.taxId,
-        coordinates: sequence.coordinates,
         select: select ?? (() => wsfe),
         options,
         supersededBy: idempotencyKey,
@@ -587,7 +586,8 @@ async function runOperation(
     if (await storeCall(() => store.add(key, JSON.stringify(record)))) {
       return await settle(
         record,
-        runAuthorization(wsfe, prepared, options, issuer, number)
+        runAuthorization(wsfe, prepared, options, issuer, number),
+        claimed
       );
     }
     const winner = await storeCall(() => store.get(key));
@@ -680,11 +680,13 @@ async function runOperation(
    * answer from ARCA is kept. A rejection is marked on the reservation before
    * the sequence marker resolves, so a claim that stops in between leaves the
    * barrier a rejection to find. The marker resolves only while it still
-   * names this claim.
+   * names this claim. A fresh claim passes the marker it just wrote under the
+   * lock; a retry reads it again.
    */
   async function settle(
     record: ArcaAttemptRecord,
-    running: Promise<IssueOutcome<IssueOptions>>
+    running: Promise<IssueOutcome<IssueOptions>>,
+    written?: ArcaSequenceRecord
   ) {
     const outcome = await recordConflict(store, settled, await running);
     if (outcome.kind === "rejected") {
@@ -695,11 +697,12 @@ async function runOperation(
       return outcome;
     }
     const marker = markerOf(record);
-    const json = await storeCall(() => store.get(marker));
-    const claimed = json === null ? null : readSequenceRecord(json);
+    const json = written ? null : await storeCall(() => store.get(marker));
+    const claimed =
+      written ?? (json === null ? null : readSequenceRecord(json));
     if (
       claimed !== null &&
-      claimed.key === idempotencyKey &&
+      isOwnClaim(claimed) &&
       claimed.number === record.number &&
       claimed.resolvedAt === undefined
     ) {
@@ -731,20 +734,11 @@ async function runOperation(
     }
     const holder = await reclaim(record);
     if (holder !== undefined) {
-      return {
-        kind: "indeterminate",
-        attempted: {
-          salesPoint: record.salesPoint,
-          voucherType: record.voucherType,
-          number: record.number,
-        },
-        attempt: replayEvidence(record.service),
-        lookup: { kind: "blocked", by: holder },
-        ...requestEvidence(preparedFromRecord(record).data, record.number, {
-          ...options,
-          service: record.service ?? "wsfe",
-        }),
-      };
+      return withheld(
+        record,
+        { kind: "blocked", by: holder.key, byTaxId: holder.issuerTaxId },
+        options
+      );
     }
     const { rejectedAt: _, ...pending } = record;
     await storeCall(() => store.set(key, JSON.stringify(pending)));
@@ -753,8 +747,8 @@ async function runOperation(
   /**
    * Takes the sequence marker back before a rejected key resends its number,
    * so a resend that gets no answer is one the barrier consults. Another
-   * key's unresolved claim may still write that number: its key comes back
-   * and nothing is sent.
+   * claim's unresolved write may still land on that number, even under the
+   * same key from another issuer: that holder comes back and nothing is sent.
    */
   async function reclaim(record: ArcaAttemptRecord) {
     if (!store.withLock) {
@@ -765,18 +759,26 @@ async function runOperation(
     const claimed = json === null ? null : readSequenceRecord(json);
     if (
       claimed !== null &&
-      claimed.key !== idempotencyKey &&
+      !isOwnClaim(claimed) &&
       claimed.resolvedAt === undefined
     ) {
-      return claimed.key;
+      return { key: claimed.key, issuerTaxId: claimed.issuerTaxId ?? taxId };
     }
     const reopened: ArcaSequenceRecord = {
       v: 1,
       key: idempotencyKey,
+      issuerTaxId: taxId,
       number: record.number,
       claimedAt: new Date().toISOString(),
     };
     await storeCall(() => store.set(marker, JSON.stringify(reopened)));
+  }
+
+  /** A marker names this claim only under this key and this issuer's CUIT. */
+  function isOwnClaim(claimed: ArcaSequenceRecord) {
+    return (
+      claimed.key === idempotencyKey && (claimed.issuerTaxId ?? taxId) === taxId
+    );
   }
 
   function markerOf(record: ArcaAttemptRecord) {
@@ -877,25 +879,47 @@ async function settledOutcome(
   ) {
     return outcome;
   }
+  return withheld(
+    reservation,
+    { kind: "superseded", by: settled.by, byTaxId: settled.byTaxId ?? taxId },
+    options,
+    settled.number
+  );
+}
+
+/**
+ * The answer for a reservation this call must not write: another claim holds
+ * its sequence, or its number went to another key.
+ */
+function withheld(
+  reservation: ArcaAttemptRecord,
+  lookup: { kind: "blocked" | "superseded"; by: string; byTaxId: string },
+  options: RecoveryOptions,
+  number = reservation.number
+): IssueOutcome<IssueOptions> {
   return {
     kind: "indeterminate",
     attempted: {
       salesPoint: reservation.salesPoint,
       voucherType: reservation.voucherType,
-      number: settled.number,
+      number,
     },
     attempt: replayEvidence(reservation.service),
-    lookup: {
-      kind: "superseded",
-      by: settled.by,
-      byTaxId: settled.byTaxId ?? taxId,
-    },
-    ...requestEvidence(
-      preparedFromRecord(reservation).data,
-      reservation.number,
-      { ...options, service: reservation.service ?? "wsfe" }
-    ),
+    lookup,
+    ...reservationEvidence(reservation, options),
   };
+}
+
+/** The request a stored reservation sent, when the caller asked for it. */
+function reservationEvidence(
+  reservation: ArcaAttemptRecord,
+  options: RecoveryOptions
+) {
+  return requestEvidence(
+    preparedFromRecord(reservation).data,
+    reservation.number,
+    { ...options, service: reservation.service ?? "wsfe" }
+  );
 }
 
 /**
@@ -943,11 +967,7 @@ function settledConflict(
     found: settled.found,
     reason:
       "This key already recorded another voucher at the reserved number. Reconcile before issuing under a new key.",
-    ...requestEvidence(
-      preparedFromRecord(reservation).data,
-      reservation.number,
-      { ...options, service: reservation.service ?? "wsfe" }
-    ),
+    ...reservationEvidence(reservation, options),
   };
 }
 
@@ -1956,43 +1976,52 @@ async function recoverOperation(
       { code: "ARCA_INPUT_IDEMPOTENCY_MISMATCH" }
     );
   }
-  const recorded = await storeCall(() => store.get(settled));
-  if (recorded !== null) {
-    return await settledOutcome(
-      select,
-      record,
-      readSettledRecord(recorded),
-      options,
-      (context as StoreContext).taxId,
-      (owner, other) =>
-        storeCall(() =>
-          store.get(
-            settledKey((context as StoreContext).environment, owner, other)
-          )
-        )
-    );
-  }
-  // A rejected key never wrote its number: a voucher there is a stranger's.
   const { environment, taxId } = context as StoreContext;
-  let outcome = await consultReservation(
-    select,
-    record,
-    options,
-    taxId,
-    record.rejectedAt !== undefined
-  );
-  if (outcome.kind === "conflict" && record.rejectedAt !== undefined) {
-    // recover() holds no lock: a retry may have cleared the rejection and
-    // written the number while this lookup ran.
+  const consult = async () => {
+    // Read again under the lock. a retry may have cleared the rejection.
     const current = readRecord(
       (await storeCall(() => store.get(attemptKey(environment, taxId, key)))) ??
         json
     );
-    if (current.rejectedAt === undefined) {
-      outcome = await consultReservation(select, current, options, taxId);
+    const recorded = await storeCall(() => store.get(settled));
+    if (recorded !== null) {
+      return await settledOutcome(
+        select,
+        current,
+        readSettledRecord(recorded),
+        options,
+        taxId,
+        (owner, other) =>
+          storeCall(() => store.get(settledKey(environment, owner, other)))
+      );
     }
+    // A rejected key never wrote its number
+    return await recordConflict(
+      store,
+      settled,
+      await consultReservation(
+        select,
+        current,
+        options,
+        taxId,
+        current.rejectedAt !== undefined
+      )
+    );
+  };
+  if (!store.withLock) {
+    return await consult();
   }
-  return await recordConflict(store, settled, outcome);
+  // A retry of this key resends under the sequence lock. Holding it keeps the
+  // rejection this call reads true until its lookup answers.
+  return await store.withLock(
+    sequenceLockKey(
+      environment,
+      record.representedTaxId ?? taxId,
+      record.salesPoint,
+      record.voucherType
+    ),
+    consult
+  );
 }
 
 /**
@@ -2180,7 +2209,6 @@ type SequenceBarrier = {
   sequence: string;
   /** The taxpayer whose numbering the sequence follows. */
   sequenceTaxId: string;
-  coordinates: Omit<VoucherCoordinates, "number">;
   select: SelectService;
   options: IssueOptions;
   supersededBy: string;
@@ -2205,7 +2233,6 @@ async function runSequenceBarrier({
   taxId,
   sequence,
   sequenceTaxId,
-  coordinates,
   select,
   options,
   supersededBy,
@@ -2243,12 +2270,11 @@ async function runSequenceBarrier({
     return {};
   }
   const blocked: BarrierResult = {
-    blocked: {
-      kind: "indeterminate",
-      attempted: { ...coordinates, number: record.number },
-      attempt: replayEvidence(options.service),
-      lookup: { kind: "blocked", by: claimed.key, byTaxId: owner },
-    },
+    blocked: withheld(
+      record,
+      { kind: "blocked", by: claimed.key, byTaxId: owner },
+      options
+    ),
   };
   const outcome = await recordConflict(
     store,
