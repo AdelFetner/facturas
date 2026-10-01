@@ -1941,7 +1941,7 @@ describe("marking a rejection", () => {
     { name: "with withLock", lock: true, marked: true },
     { name: "without withLock", lock: false, marked: false },
   ])(
-    "marks a WSMTXCA first-send rejection only $name",
+    "marks a WSMTXCA first-send rejection $name: $marked",
     async ({ lock, marked }) => {
       const { wsfe } = provider();
       const wsmtxca = {

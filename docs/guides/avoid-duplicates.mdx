@@ -185,7 +185,8 @@ anota siempre, con o sin `withLock`. Sin `withLock`, un doble envío de la misma
 clave puede dejar su propio CAE anotado como conflicto, que se concilia a
 mano. Sin `withLock`, además, el rechazo de ese primer envío no se marca si ARCA
 lo rechazó con un código que puede indicar un número ocupado, y el `conflict`
-que encuentra una repetición después de un rechazo se devuelve pero no se anota,
+que encuentra una repetición o un `recover()` después de un rechazo se devuelve
+pero no se anota,
 porque otra llamada con la misma clave puede haber escrito el número, y la
 llamada siguiente lo vuelve a consultar. Si para entonces el rechazo ya no está
 marcado, porque el reenvío chocó con otro envío o ARCA lo rechazó con un código
