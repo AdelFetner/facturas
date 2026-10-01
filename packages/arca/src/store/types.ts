@@ -20,10 +20,13 @@ export type ArcaStore = {
  * line spellings: releases through 0.12 wrote `details`; 0.13 writes `lines`,
  * or `authorizedLines` when a full note mirrors provider-authorized history.
  *
- * `rejectedAt` marks a reservation whose last submission ARCA rejected, so
+ * `rejectedAt` marks a reservation whose every submission ARCA rejected, so
  * this key never wrote its number and any voucher found there is a
  * stranger's. It is the one field rewritten with `set`: cleared before a
- * retry resends the number and written again if ARCA rejects that too.
+ * retry resends the number and written again only if ARCA rejects that send
+ * too. A rejection that follows a submission left without an answer is not
+ * marked, since that write may still land: the reservation stays pending and
+ * its retries match a voucher there by its fiscal fields.
  * Readers that predate it ignore it and match a voucher there by its fiscal
  * fields, so every process sharing a store must run a release that knows it.
  */
