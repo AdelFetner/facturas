@@ -257,17 +257,31 @@ export function resolveCheckEnvironment(
   if (chosen) {
     return chosen;
   }
-  if (flags.cert?.trim() || io.env.ARCA_CERTIFICATE_PEM?.trim()) {
-    return undefined;
-  }
   try {
-    const discovery = discoverCredentials(resolveDirectory(io, flags.dir));
+    const { discovery } = resolveCredentials(io, flags);
     return discovery.kind === "found"
       ? discovery.credentials.environment
       : undefined;
   } catch {
     return undefined;
   }
+}
+
+function resolveCredentials(
+  io: CliIo,
+  flags: CheckFlags,
+  environment?: ArcaEnvironment
+) {
+  const certificatePem = readPem(io, flags.cert, io.env.ARCA_CERTIFICATE_PEM);
+  const privateKeyPem = readPem(io, flags.key, io.env.ARCA_PRIVATE_KEY_PEM);
+  const discovery: CredentialDiscovery =
+    certificatePem && privateKeyPem
+      ? { kind: "none" }
+      : discoverCredentials(resolveDirectory(io, flags.dir), environment, {
+          certificatePem,
+          privateKeyPem,
+        });
+  return { certificatePem, privateKeyPem, discovery };
 }
 
 /**
@@ -291,16 +305,13 @@ function resolveConfigLayer(
 
   let certificatePem: string | undefined;
   let privateKeyPem: string | undefined;
-  let discovery: CredentialDiscovery = { kind: "none" };
+  let discovery: CredentialDiscovery;
   try {
-    certificatePem = readPem(io, flags.cert, io.env.ARCA_CERTIFICATE_PEM);
-    privateKeyPem = readPem(io, flags.key, io.env.ARCA_PRIVATE_KEY_PEM);
-    if (!(certificatePem && privateKeyPem)) {
-      discovery = discoverCredentials(
-        resolveDirectory(io, flags.dir),
-        toEnvironment(chosenEnvironment)
-      );
-    }
+    ({ certificatePem, privateKeyPem, discovery } = resolveCredentials(
+      io,
+      flags,
+      toEnvironment(chosenEnvironment)
+    ));
   } catch (error) {
     const unknown = describeUnknownError(error);
     return {
@@ -347,7 +358,7 @@ function resolveConfigLayer(
         name: "config",
         ok: true,
         detail: describeSources({
-          ...describeCredentialSource(flags, found),
+          ...describeCredentialSource(flags, found, certificatePem),
           taxId: taxId.source,
           ...describeEnvironmentSource(io, flags, config.environment),
         }),
@@ -453,15 +464,17 @@ function readPem(
  */
 function describeCredentialSource(
   flags: CheckFlags,
-  found: DiscoveredCredentials | undefined
+  found: DiscoveredCredentials | undefined,
+  suppliedCertificate: string | undefined
 ): { credentials?: string } {
-  if (found !== undefined) {
-    return { credentials: `${found.certificateFile} en este directorio` };
-  }
   const named = [
     ...(flags.cert?.trim() ? ["--cert"] : []),
     ...(flags.key?.trim() ? ["--key"] : []),
   ];
+  if (found !== undefined) {
+    const file = suppliedCertificate ? found.keyFile : found.certificateFile;
+    named.push(`${file} en este directorio`);
+  }
   return named.length === 0 ? {} : { credentials: named.join(" y ") };
 }
 
