@@ -222,8 +222,16 @@ type Settling = {
   written?: ArcaSequenceRecord;
   /** ARCA rejected every earlier send of this key, if there was any. */
   everyRejected?: boolean;
-  /** The answer rests on this key never having written its number. */
+  /**
+   * The answer rests on this key never having written its number: without
+   * withLock, a conflict found this way is not kept.
+   */
   presumed?: boolean;
+  /**
+   * Another call of this key may be writing the same number: without
+   * withLock, a 10016 that follows says nothing, so it is not marked.
+   */
+  racing?: boolean;
 };
 type Prepared = Omit<ReturnType<typeof deriveWsfeInvoice>, "data"> & {
   data: IssuanceHeader;
@@ -584,8 +592,8 @@ async function runOperation(
           strangerAtNumber: true,
         }),
         // Without the lock, a retry of this key may write the number while
-        // this claim is still in flight.
-        { written: claimed, everyRejected: true, presumed: !coordinated }
+        // this claim is still in flight: its 10016 is not marked.
+        { written: claimed, everyRejected: true, racing: !coordinated }
       );
     }
     const winner = await storeCall(() => store.get(key));
@@ -651,7 +659,7 @@ async function runOperation(
         current.number,
         { lookupFirst: !rejected, strangerAtNumber: rejected }
       ),
-      { everyRejected: rejected, presumed: rejected }
+      { everyRejected: rejected, presumed: rejected, racing: rejected }
     );
   }
   /**
@@ -665,22 +673,31 @@ async function runOperation(
   async function settle(
     record: ArcaAttemptRecord,
     running: Promise<IssueOutcome<IssueOptions>>,
-    { written, everyRejected = false, presumed = false }: Settling = {}
+    {
+      written,
+      everyRejected = false,
+      presumed = false,
+      racing = false,
+    }: Settling = {}
   ) {
     // Without the lock, a call that presumes this key never wrote its number
     // may race another call of this key that just wrote it. Its answer stands,
-    // but nothing it presumed is kept: a later call checks the number again.
-    const guessed = presumed && !store.withLock;
+    // but a conflict it found is not kept: a later call checks the number again.
+    const uncoordinated = !store.withLock;
     const outcome = await recordConflict(
       store,
       settled,
       await running,
-      !guessed
+      !(presumed && uncoordinated)
     );
     const marks =
       outcome.kind === "rejected" &&
       everyRejected &&
-      !(guessed && mayHoldNumber(outcome.issues, record.service));
+      !(
+        uncoordinated &&
+        racing &&
+        mayHoldNumber(outcome.issues, record.service)
+      );
     if (marks) {
       const rejected = { ...record, rejectedAt: new Date().toISOString() };
       await storeCall(() => store.set(key, JSON.stringify(rejected)));

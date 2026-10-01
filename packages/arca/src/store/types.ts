@@ -50,7 +50,8 @@ export type ArcaAttemptRecord = {
 
 /**
  * Settled outcome of a reservation, created once with `add` and never
- * rewritten. A `conflict` records the stranger found at the reserved number. A
+ * rewritten. A `conflict` records the voucher found at the reserved number, which without
+ * `withLock` can be this key's own after a double submit. A
  * `superseded` record says the sequence moved past this reservation: the
  * barrier proved the number was empty and handed it to `by`, so this key can
  * never write. Authorizations are not recorded, because ARCA is their source of

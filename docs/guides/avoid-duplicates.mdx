@@ -180,16 +180,20 @@ repetición o un `recover()` que encuentran un comprobante ahí devuelven
 `conflict`, venga de otra clave, de un `issue()` sin clave o de otro sistema.
 Si un envío anterior quedó sin respuesta, puede haber llegado, así que el
 rechazo no se marca y la repetición compara el comprobante por sus datos
-fiscales como antes. Sin `withLock`, ese `conflict` se devuelve pero no se
-anota, porque otra llamada con la misma clave puede haber escrito el número, y
-la llamada siguiente lo vuelve a consultar. Si para entonces el rechazo ya no
-está marcado, porque el reenvío chocó con otro envío o ARCA lo rechazó con un
-código que puede indicar un número ocupado, la clave compara el comprobante por
-sus datos fiscales, como antes. Si el número sigue vacío, la repetición lo
-reenvía. Si el store
-falla al anotar el conflicto,
-la llamada lanza `ArcaConfigurationError` en vez de devolver un conflicto que
-un reintento podría no volver a ver.
+fiscales como antes. El `conflict` que encuentra el primer envío de una clave se
+anota siempre, con o sin `withLock`. Sin `withLock`, un doble envío de la misma
+clave puede dejar su propio CAE anotado como conflicto, que se concilia a
+mano. Sin `withLock`, además, el rechazo de ese primer envío no se marca si ARCA
+lo rechazó con un código que puede indicar un número ocupado, y el `conflict`
+que encuentra una repetición después de un rechazo se devuelve pero no se anota,
+porque otra llamada con la misma clave puede haber escrito el número, y la
+llamada siguiente lo vuelve a consultar. Si para entonces el rechazo ya no está
+marcado, porque el reenvío chocó con otro envío o ARCA lo rechazó con un código
+que puede indicar un número ocupado, la clave compara el comprobante por sus
+datos fiscales, como antes. Si el número sigue vacío, la repetición lo reenvía.
+Si el store falla al anotar uno de los conflictos que sí se anotan, la llamada
+lanza `ArcaConfigurationError` en vez de devolver un conflicto que un reintento
+podría no volver a ver.
 
 Cada registro lleva su versión. `v: 1` es una reserva de WSFE sin detalle.
 `v: 2` es una reserva de WSMTXCA o con detalle de ítems, y siempre nombra su
